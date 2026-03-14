@@ -119,6 +119,29 @@ class DB:
             ).fetchall()
             return [r["task_tag"] for r in rows]
 
+    def update_score(
+        self,
+        call_id: int,
+        result: Score,
+        embed_model: str | None = None,
+    ) -> None:
+        """Overwrite score fields for a specific call row (used by rescore)."""
+        with self._connect() as conn:
+            conn.execute(
+                """
+                UPDATE calls
+                SET score = ?, score_flags = ?, confidence = ?, embed_model = ?
+                WHERE id = ?
+                """,
+                (
+                    result.value,
+                    json.dumps(result.flags),
+                    result.confidence,
+                    embed_model,
+                    call_id,
+                ),
+            )
+
     def export(
         self,
         task_tag: str | None = None,

@@ -7,6 +7,7 @@ Commands:
   evalloop status --tag <name>  Show trend for a specific tag
   evalloop watch                Poll for regressions, alert to terminal
   evalloop export               Export captured calls to JSON or CSV
+  evalloop rescore              Re-score existing calls with current baselines
   evalloop baseline add <text>  Add a known-good output to a task tag
   evalloop baseline list        List all task tags with baselines
   evalloop baseline install     Install curated default baselines
@@ -25,8 +26,15 @@ from collections import Counter
 import click
 
 from evalloop.baseline import add as baseline_add, list_tags
+from evalloop.baseline import load as baseline_load
+from evalloop.capture import _detect_scorer
 from evalloop.db import DB
 from evalloop.defaults import DEFAULTS, install as defaults_install, install_all
+from evalloop.scorer import (
+    heuristics_score as _heuristics_score,
+    llm_judge_score as _llm_judge_score,
+    score as _voyage_score,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -349,6 +357,51 @@ def baseline_install_cmd(tag: str | None, overwrite: bool) -> None:
             click.echo(f"  Skipped (already exist): {', '.join(sorted(skipped))}  (use --overwrite)")
         if not installed:
             click.echo("All defaults already installed. Use --overwrite to replace.")
+
+
+@cli.command()
+@click.option("--tag", default=None, help="Re-score only calls with this task tag.")
+@click.option("--db", "db_path", default=None, help="Path to evalloop DB.")
+def rescore(tag: str | None, db_path: str | None) -> None:
+    """Re-score existing calls using current baselines and scoring backend."""
+    db = DB(db_path)
+    rows = db.export(task_tag=tag, limit=100_000)
+
+    if not rows:
+        click.echo("No calls found to re-score.")
+        return
+
+    backend = _detect_scorer()
+    backend_label = {"voyage": "Voyage AI", "anthropic": "LLM-as-judge", "heuristics": "heuristics"}[backend]
+    click.echo(f"Re-scoring {len(rows)} call(s) using {backend_label}...\n")
+
+    updated = skipped = errors = 0
+    for row in rows:
+        call_id = row["id"]
+        output = row["output_text"] or ""
+        task = row["task_tag"] or "default"
+
+        baselines = baseline_load(task)
+
+        try:
+            if backend == "anthropic":
+                result = _llm_judge_score(output, baselines)
+                embed_model = "claude-haiku-llm-judge"
+            elif backend == "voyage":
+                result = _voyage_score(output, baselines)
+                embed_model = "voyage-3-lite"
+            else:
+                result = _heuristics_score(output, baselines)
+                embed_model = None
+
+            db.update_score(call_id, result, embed_model)
+            updated += 1
+        except Exception as exc:  # noqa: BLE001
+            click.echo(f"  ⚠  id={call_id}: {exc}", err=True)
+            errors += 1
+
+    click.echo(f"Done. Updated: {updated}  Skipped: {skipped}  Errors: {errors}")
+    click.echo("Run `evalloop status` to see updated scores.")
 
 
 @cli.command()
