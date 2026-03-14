@@ -130,12 +130,16 @@ class _CaptureWorker:
             try:
                 call = self._queue.get(timeout=1.0)
                 if call is None:
+                    self._queue.task_done()
                     break
-                self._process(call)
+                try:
+                    self._process(call)
+                except Exception as exc:  # noqa: BLE001
+                    _warn(f"evalloop: worker error — {exc}")
+                finally:
+                    self._queue.task_done()
             except queue.Empty:
                 continue
-            except Exception as exc:  # noqa: BLE001
-                _warn(f"evalloop: worker error — {exc}")
 
     def _process(self, call: CapturedCall) -> None:
         try:
@@ -157,10 +161,15 @@ class _CaptureWorker:
             _warn(f"evalloop: db insert error — {exc}")
 
     def flush(self, timeout: float = 5.0) -> None:
-        """Block until queue is empty or timeout. Useful in tests."""
-        deadline = time.monotonic() + timeout
-        while not self._queue.empty() and time.monotonic() < deadline:
-            time.sleep(0.05)
+        """Block until all queued calls are fully processed or timeout."""
+        # queue.join() blocks until every put()'d item has called task_done()
+        done = threading.Event()
+        def _join() -> None:
+            self._queue.join()
+            done.set()
+        t = threading.Thread(target=_join, daemon=True)
+        t.start()
+        done.wait(timeout=timeout)
 
 
 # Module-level singleton worker (lazy init on first wrap() call)
