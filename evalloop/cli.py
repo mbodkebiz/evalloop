@@ -2,6 +2,7 @@
 cli.py — evalloop status dashboard.
 
 Commands:
+  evalloop init                 Set up evalloop — choose scoring backend
   evalloop status               Show score trend for all task tags
   evalloop status --tag <name>  Show trend for a specific tag
   evalloop watch                Poll for regressions, alert to terminal
@@ -17,6 +18,7 @@ from __future__ import annotations
 import csv
 import io
 import json
+import os
 import time
 from collections import Counter
 
@@ -103,6 +105,112 @@ def _print_status(db: DB, tag: str, now: float) -> bool:
 def cli() -> None:
     """evalloop — closed-loop eval monitoring for LLM-powered products."""
 
+
+# ---------------------------------------------------------------------------
+# init — setup wizard
+# ---------------------------------------------------------------------------
+
+_ANTHROPIC_SIGNUP = "https://console.anthropic.com/api-keys"
+_VOYAGE_SIGNUP = "https://dash.voyageai.com/api-keys"
+
+
+@cli.command()
+def init() -> None:
+    """Set up evalloop — detect API keys and choose a scoring backend."""
+    click.echo("\nevalloop setup")
+    click.echo("──────────────")
+
+    has_anthropic = bool(os.environ.get("ANTHROPIC_API_KEY"))
+    has_voyage = bool(os.environ.get("VOYAGE_API_KEY"))
+
+    tick = click.style("✓", fg="green")
+    cross = click.style("✗", fg="red")
+
+    click.echo(f"{'  ' + tick if has_anthropic else '  ' + cross} ANTHROPIC_API_KEY"
+               + (" (detected)" if has_anthropic else ""))
+    click.echo(f"{'  ' + tick if has_voyage else '  ' + cross} VOYAGE_API_KEY"
+               + (" (detected)" if has_voyage else ""))
+    click.echo()
+
+    if has_voyage:
+        click.echo(tick + " Voyage AI scoring ready — best semantic accuracy.")
+        _init_install_baselines()
+        _init_done()
+        return
+
+    if has_anthropic:
+        click.echo(tick + " Anthropic scoring ready — LLM-as-judge via claude-haiku.")
+        click.echo("  Tip: add VOYAGE_API_KEY for better semantic accuracy (optional).")
+        _init_install_baselines()
+        _init_done()
+        return
+
+    # Neither key found — present the choice
+    click.echo("No scoring API keys found. Choose a backend:\n")
+    click.echo("  [A] Anthropic  — LLM-as-judge via claude-haiku")
+    click.echo("      ~$0.001 per 1000 scored calls")
+    click.echo(f"      Get key → {_ANTHROPIC_SIGNUP}\n")
+    click.echo("  [V] Voyage AI  — semantic embeddings, best accuracy")
+    click.echo("      Free tier: 50M tokens/month")
+    click.echo(f"      Get key → {_VOYAGE_SIGNUP}\n")
+    click.echo("  [S] Skip       — heuristics only (no semantic scoring)\n")
+
+    raw = click.prompt("Choice", default="A")
+    choice = raw.strip().upper()[:1]
+
+    if choice == "A":
+        click.echo()
+        click.echo("1. Get your Anthropic API key:")
+        click.echo(f"   {_ANTHROPIC_SIGNUP}")
+        click.echo()
+        click.echo("2. Add it to your environment:")
+        click.echo("   export ANTHROPIC_API_KEY=sk-ant-...")
+        click.echo("   # or add to your .env file")
+    elif choice == "V":
+        click.echo()
+        click.echo("1. Get your Voyage AI key (free tier available):")
+        click.echo(f"   {_VOYAGE_SIGNUP}")
+        click.echo()
+        click.echo("2. Add it to your environment:")
+        click.echo("   export VOYAGE_API_KEY=pa-...")
+        click.echo("   # or add to your .env file")
+    else:
+        click.echo()
+        click.echo("Running in heuristics-only mode.")
+        click.echo("evalloop will still catch empty, truncated, and runaway outputs.")
+        _init_install_baselines()
+
+    click.echo()
+    click.echo("Then wrap your client:")
+    click.echo()
+    click.echo("  from evalloop import wrap")
+    click.echo("  import anthropic")
+    click.echo()
+    click.echo("  client = wrap(anthropic.Anthropic())")
+    click.echo()
+
+
+def _init_install_baselines() -> None:
+    results = install_all(overwrite=False)
+    installed = sum(1 for n in results.values() if n > 0)
+    if installed:
+        click.echo(f"  Installed default baselines for {installed} task type(s).")
+
+
+def _init_done() -> None:
+    click.echo()
+    click.echo("You're set up. Wrap your client and start capturing:")
+    click.echo()
+    click.echo("  from evalloop import wrap")
+    click.echo("  client = wrap(anthropic.Anthropic())")
+    click.echo()
+    click.echo("Then check your scores: evalloop status")
+    click.echo()
+
+
+# ---------------------------------------------------------------------------
+# status
+# ---------------------------------------------------------------------------
 
 @cli.command()
 @click.option("--tag", default=None, help="Filter to a specific task tag.")

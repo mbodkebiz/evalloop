@@ -42,12 +42,21 @@ Prompt change pushed Friday 5pm
 pip install evalloop
 ```
 
-Requires Python 3.9+. Needs a [Voyage AI](https://www.voyageai.com) key for semantic scoring (free tier available).
+Requires Python 3.9+. Then run the setup wizard:
 
 ```bash
-export VOYAGE_API_KEY=your_voyage_key
-export ANTHROPIC_API_KEY=your_key   # or OPENAI_API_KEY
+evalloop init
 ```
+
+evalloop auto-detects your scoring backend from environment variables — no extra config needed:
+
+| Keys you have | Scoring backend | Accuracy |
+|---|---|---|
+| `VOYAGE_API_KEY` | Semantic embeddings via Voyage AI | Best |
+| `ANTHROPIC_API_KEY` | LLM-as-judge via claude-haiku | Good |
+| Neither | Heuristics only (length/format) | Basic |
+
+If you're already wrapping an Anthropic or OpenAI client, evalloop uses your existing key automatically — no extra signup required.
 
 ---
 
@@ -57,7 +66,7 @@ export ANTHROPIC_API_KEY=your_key   # or OPENAI_API_KEY
 from evalloop import wrap
 import anthropic
 
-# One line change — use your client exactly as before
+# One line change — evalloop uses your existing ANTHROPIC_API_KEY automatically
 client = wrap(anthropic.Anthropic(), task_tag="qa")
 
 resp = client.messages.create(
@@ -149,6 +158,9 @@ Supported task types for auto-inference: `qa`, `summarization`, `code`, `custome
 ## CLI commands
 
 ```bash
+# First-time setup — detect keys, choose scoring backend, install baselines
+evalloop init
+
 # Score trends for all tags
 evalloop status
 
@@ -179,15 +191,18 @@ evalloop defaults
 
 ## Scoring
 
-evalloop uses **consistency-first scoring**: deterministic heuristics + semantic similarity to your baselines. No LLM-as-judge.
+evalloop uses **consistency-first scoring**: deterministic heuristics run first, then the best available semantic backend.
 
 | Signal | What it catches |
 |--------|----------------|
 | Empty / whitespace output | Total failures |
 | Too short (< 15% of baseline length) | Truncation |
 | Too long (> 5x baseline length) | Rambling, prompt injection |
-| Cosine similarity to baseline centroid | Semantic drift, off-topic responses |
-| `degraded_mode` flag | Voyage AI unavailable — heuristics only |
+| Cosine similarity to baseline centroid | Semantic drift (Voyage backend) |
+| LLM-as-judge rating | Quality regression (Anthropic backend) |
+| `degraded_mode` flag | No scoring backend available — heuristics only |
+
+Backend is auto-detected from your environment. Run `evalloop init` to configure.
 
 Scores range 0.0–1.0. A score below your 7-day average by >5pp triggers a regression flag.
 
@@ -275,8 +290,8 @@ evalloop export --tag qa --limit 500
 
 - **Storage**: SQLite at `~/.evalloop/calls.db` (WAL mode — concurrent reads while writing)
 - **Baselines**: JSONL files at `~/.evalloop/baselines/<tag>.jsonl`
-- **Embeddings**: [Voyage AI](https://www.voyageai.com) `voyage-3-lite` (512-dim, fast, cheap)
-- **Embed model provenance**: stored per-row so score history remains interpretable if model changes
+- **Scoring backends**: Voyage AI `voyage-3-lite` (semantic embeddings) or Claude Haiku (LLM-as-judge) — auto-detected from env vars
+- **Score model provenance**: stored per-row so history remains interpretable if backend changes
 - **No cloud dependency** — everything runs locally
 
 ---

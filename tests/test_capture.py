@@ -329,20 +329,42 @@ def test_store_inputs_true_stores_messages():
 # ---------------------------------------------------------------------------
 
 
-def test_wrap_warns_when_voyage_key_missing(capsys, monkeypatch):
+def test_wrap_silent_when_no_scoring_keys(capsys, monkeypatch):
+    """wrap() is silent when no scoring keys are set — heuristics mode, no wall."""
     monkeypatch.delenv("VOYAGE_API_KEY", raising=False)
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
     client = _anthropic_client()
     wrap(client)
     captured = capsys.readouterr()
-    assert "VOYAGE_API_KEY" in captured.err
+    assert captured.err == ""
 
 
-def test_wrap_no_warn_when_voyage_key_present(capsys, monkeypatch):
-    monkeypatch.setenv("VOYAGE_API_KEY", "pa-testkey123")
-    client = _anthropic_client()
-    wrap(client)
-    captured = capsys.readouterr()
-    assert "VOYAGE_API_KEY" not in captured.err
+def test_detect_scorer_voyage(monkeypatch):
+    from evalloop.capture import _detect_scorer
+    monkeypatch.setenv("VOYAGE_API_KEY", "pa-testkey")
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    assert _detect_scorer() == "voyage"
+
+
+def test_detect_scorer_anthropic(monkeypatch):
+    from evalloop.capture import _detect_scorer
+    monkeypatch.delenv("VOYAGE_API_KEY", raising=False)
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-testkey")
+    assert _detect_scorer() == "anthropic"
+
+
+def test_detect_scorer_heuristics(monkeypatch):
+    from evalloop.capture import _detect_scorer
+    monkeypatch.delenv("VOYAGE_API_KEY", raising=False)
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    assert _detect_scorer() == "heuristics"
+
+
+def test_detect_scorer_prefers_voyage_over_anthropic(monkeypatch):
+    from evalloop.capture import _detect_scorer
+    monkeypatch.setenv("VOYAGE_API_KEY", "pa-testkey")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-testkey")
+    assert _detect_scorer() == "voyage"
 
 
 # ---------------------------------------------------------------------------

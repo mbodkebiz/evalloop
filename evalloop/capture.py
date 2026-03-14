@@ -58,10 +58,26 @@ from typing import Any
 
 from evalloop._utils import _warn
 from evalloop.db import DB
+from evalloop.scorer import llm_judge_score as _llm_judge_score
 from evalloop.scorer import score as _score
 
-# Embedding model name stored alongside each score for provenance
-_EMBED_MODEL = "voyage-3-lite"
+# Scoring backend model names stored per-row for provenance
+_VOYAGE_MODEL = "voyage-3-lite"
+_LLM_JUDGE_MODEL = "claude-haiku-4-5-20251001"
+
+
+def _detect_scorer() -> str:
+    """
+    Auto-detect the best available scoring backend from env vars.
+    Priority: voyage > anthropic > heuristics (silent — no warning).
+
+    Returns: "voyage" | "anthropic" | "heuristics"
+    """
+    if os.environ.get("VOYAGE_API_KEY"):
+        return "voyage"
+    if os.environ.get("ANTHROPIC_API_KEY"):
+        return "anthropic"
+    return "heuristics"
 
 
 # ---------------------------------------------------------------------------
@@ -165,6 +181,8 @@ class _CaptureWorker:
                 continue
 
     def _process(self, call: CapturedCall) -> None:
+        result = None
+        scorer_backend = None
         try:
             from evalloop.baseline import load as _load_baselines
             from evalloop.defaults import install as _install_defaults
@@ -173,16 +191,30 @@ class _CaptureWorker:
             if not baselines:
                 _install_defaults(call.task_tag)
                 baselines = _load_baselines(call.task_tag)
-            result = _score(call.output_text, baselines)
+
+            scorer_backend = _detect_scorer()
+            if scorer_backend == "anthropic":
+                result = _llm_judge_score(call.output_text, baselines)
+            else:
+                # voyage or heuristics — both use score(); voyage has embed,
+                # heuristics falls through to degraded_mode automatically
+                result = _score(call.output_text, baselines)
         except Exception as exc:  # noqa: BLE001
             _warn(f"evalloop: scoring error — {exc}")
-            result = None
 
         if self._db is None:
             return
 
         try:
-            embed_model = _EMBED_MODEL if result and "degraded_mode" not in result.flags else None
+            if result and "degraded_mode" not in result.flags:
+                if scorer_backend == "anthropic":
+                    embed_model = _LLM_JUDGE_MODEL
+                elif scorer_backend == "voyage":
+                    embed_model = _VOYAGE_MODEL
+                else:
+                    embed_model = None
+            else:
+                embed_model = None
             self._db.insert(call, result, embed_model=embed_model)
         except Exception as exc:  # noqa: BLE001
             _warn(f"evalloop: db insert error — {exc}")
@@ -383,14 +415,6 @@ def wrap(client: Any, task_tag: str = "default", store_inputs: bool = True) -> A
         A proxy client. Use it exactly like the original.
         Zero latency added — capture happens in a background thread.
     """
-    # Warn loudly if VOYAGE_API_KEY is missing — scoring will be degraded
-    if not os.environ.get("VOYAGE_API_KEY"):
-        _warn(
-            "evalloop: VOYAGE_API_KEY not set — scores will use degraded mode "
-            "(heuristics only, no semantic similarity). "
-            "Get a free key at https://www.voyageai.com"
-        )
-
     # Detect client type by module name — avoids hard import deps
     module = type(client).__module__ or ""
     if module.startswith("anthropic"):
