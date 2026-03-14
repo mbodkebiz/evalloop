@@ -140,7 +140,12 @@ class _CaptureWorker:
     def _process(self, call: CapturedCall) -> None:
         try:
             from evalloop.baseline import load as _load_baselines
+            from evalloop.defaults import install as _install_defaults
             baselines = _load_baselines(call.task_tag)
+            # Auto-install defaults on first use if no baselines exist yet
+            if not baselines:
+                _install_defaults(call.task_tag)
+                baselines = _load_baselines(call.task_tag)
             result = _score(call.output_text, baselines)
         except Exception as exc:  # noqa: BLE001
             _warn(f"evalloop: scoring error — {exc}")

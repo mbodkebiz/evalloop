@@ -6,6 +6,8 @@ Commands:
   evalloop status --tag <name>  Show trend for a specific tag
   evalloop baseline add <text>  Add a known-good output to a task tag
   evalloop baseline list        List all task tags with baselines
+  evalloop baseline install     Install curated default baselines
+  evalloop defaults             List available built-in task types
 """
 
 from __future__ import annotations
@@ -17,6 +19,7 @@ import click
 
 from evalloop.baseline import add as baseline_add, list_tags
 from evalloop.db import DB
+from evalloop.defaults import DEFAULTS, install as defaults_install, install_all
 
 
 # ---------------------------------------------------------------------------
@@ -133,7 +136,45 @@ def baseline_list_cmd() -> None:
     tags = list_tags()
     if not tags:
         click.echo("No baselines yet. Add one:\n")
-        click.echo('    evalloop baseline add "your good output" --tag my-task\n')
+        click.echo('    evalloop baseline add "your good output" --tag my-task')
+        click.echo("Or install built-in defaults:\n")
+        click.echo("    evalloop baseline install\n")
         return
     for t in sorted(tags):
         click.echo(f"  {t}")
+
+
+@baseline.command("install")
+@click.option("--tag", default=None, help="Install defaults for a specific tag only.")
+@click.option("--overwrite", is_flag=True, default=False, help="Overwrite existing baselines.")
+def baseline_install_cmd(tag: str | None, overwrite: bool) -> None:
+    """Install curated default baselines (solves cold-start problem)."""
+    if tag:
+        if tag not in DEFAULTS:
+            click.echo(f"Unknown tag '{tag}'. Available: {', '.join(sorted(DEFAULTS))}")
+            return
+        n = defaults_install(tag, overwrite=overwrite)
+        if n == 0:
+            click.echo(f"[{tag}] already has baselines. Use --overwrite to replace.")
+        else:
+            click.echo(f"Installed {n} default examples for [{tag}].")
+    else:
+        results = install_all(overwrite=overwrite)
+        installed = {t: n for t, n in results.items() if n > 0}
+        skipped = {t: n for t, n in results.items() if n == 0}
+        for t, n in sorted(installed.items()):
+            click.echo(f"  [{t}] installed {n} examples")
+        if skipped:
+            click.echo(f"  Skipped (already exist): {', '.join(sorted(skipped))}  (use --overwrite)")
+        if not installed:
+            click.echo("All defaults already installed. Use --overwrite to replace.")
+
+
+@cli.command()
+def defaults() -> None:
+    """List available built-in task types and their example count."""
+    click.echo("\nBuilt-in task types:\n")
+    for tag, examples in sorted(DEFAULTS.items()):
+        click.echo(f"  {tag:<20} {len(examples)} examples")
+    click.echo(f"\nInstall all:  evalloop baseline install")
+    click.echo(f"Install one:  evalloop baseline install --tag qa\n")

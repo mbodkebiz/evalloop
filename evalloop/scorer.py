@@ -57,17 +57,15 @@ _MIN_WORDS = 3
 
 def _embed(texts: list[str]) -> list[list[float]]:
     """
-    Default: calls openai text-embedding-3-small.
+    Default: calls Voyage AI voyage-3-lite (Anthropic's recommended embedding partner).
+    Requires VOYAGE_API_KEY env var or voyageai package config.
     Injected in tests via unittest.mock.patch("evalloop.scorer._embed", ...).
     """
-    from openai import OpenAI  # lazy import — not required at module load
+    import voyageai  # lazy import — not required at module load
 
-    client = OpenAI()
-    response = client.embeddings.create(
-        model="text-embedding-3-small",
-        input=texts,
-    )
-    return [item.embedding for item in response.data]
+    client = voyageai.Client()
+    result = client.embed(texts, model="voyage-3-lite")
+    return result.embeddings
 
 
 # ---------------------------------------------------------------------------
