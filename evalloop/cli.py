@@ -10,6 +10,7 @@ Commands:
   evalloop rescore              Re-score existing calls with current baselines
   evalloop baseline add <text>  Add a known-good output to a task tag
   evalloop baseline list        List all task tags with baselines
+  evalloop baseline show        Show the actual baseline examples
   evalloop baseline install     Install curated default baselines
   evalloop defaults             List available built-in task types
 """
@@ -431,7 +432,29 @@ def baseline_list_cmd() -> None:
         click.echo("    evalloop baseline install\n")
         return
     for t in sorted(tags):
-        click.echo(f"  {t}")
+        examples = baseline_load(t)
+        click.echo(f"  {t}  ({len(examples)} example{'s' if len(examples) != 1 else ''})")
+
+
+@baseline.command("show")
+@click.option("--tag", default=None, help="Task tag to show baselines for (default: all tags).")
+def baseline_show_cmd(tag: str | None) -> None:
+    """Show the actual baseline examples for a task tag."""
+    tags = [tag] if tag else sorted(list_tags())
+    if not tags:
+        click.echo("No baselines yet. Add one:\n")
+        click.echo('    evalloop baseline add "your good output" --tag my-task\n')
+        return
+    for t in tags:
+        examples = baseline_load(t)
+        if not examples:
+            continue
+        click.echo(f"\n── {t}  ({len(examples)} example{'s' if len(examples) != 1 else ''}) ──")
+        for i, ex in enumerate(examples, 1):
+            # Truncate long examples for readability
+            display = ex if len(ex) <= 120 else ex[:117] + "..."
+            click.echo(f"  {i}. {display}")
+    click.echo()
 
 
 @baseline.command("install")
