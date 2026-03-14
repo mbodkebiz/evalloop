@@ -4,6 +4,8 @@ cli.py — evalloop status dashboard.
 Commands:
   evalloop status               Show score trend for all task tags
   evalloop status --tag <name>  Show trend for a specific tag
+  evalloop watch                Poll for regressions, alert to terminal
+  evalloop export               Export captured calls to JSON or CSV
   evalloop baseline add <text>  Add a known-good output to a task tag
   evalloop baseline list        List all task tags with baselines
   evalloop baseline install     Install curated default baselines
@@ -12,8 +14,11 @@ Commands:
 
 from __future__ import annotations
 
-import sys
+import csv
+import io
+import json
 import time
+from collections import Counter
 
 import click
 
@@ -39,6 +44,56 @@ def _avg(values: list[float]) -> float:
     return sum(values) / len(values) if values else 0.0
 
 
+def _print_status(db: DB, tag: str, now: float) -> bool:
+    """Print status block for a single tag. Returns True if regression detected."""
+    day = 86_400
+    rows = db.recent(task_tag=tag, limit=500)
+    if not rows:
+        return False
+
+    scored = [r for r in rows if r["score"] is not None]
+    recent_7d = [r for r in scored if now - r["ts"] < 7 * day]
+    recent_1d = [r for r in scored if now - r["ts"] < day]
+
+    scores_7d = [r["score"] for r in recent_7d]
+    scores_1d = [r["score"] for r in recent_1d]
+    all_scores = [r["score"] for r in scored]
+
+    avg_7d = _avg(scores_7d)
+    avg_1d = _avg(scores_1d)
+    regression = avg_1d < avg_7d - 0.05 if scores_7d and scores_1d else False
+
+    status_icon = "🔴" if regression else "🟢"
+    click.echo(f"\n{status_icon}  [{tag}]")
+    click.echo(f"   Calls captured : {len(rows)}")
+    click.echo(f"   Scored         : {len(scored)}")
+    click.echo(f"   Avg (7d)       : {avg_7d:.2f}")
+    click.echo(f"   Avg (24h)      : {avg_1d:.2f}" if scores_1d else "   Avg (24h)      : —")
+
+    if regression:
+        drop = (avg_7d - avg_1d) * 100
+        click.echo(f"   ⚠  Regression   : score dropped {drop:.1f}pp in last 24h")
+
+    if all_scores:
+        bar = _trend_bar(list(reversed(all_scores)))
+        click.echo(f"   Trend (recent) : {bar}")
+
+    # Surface top flags
+    all_flags: list[str] = []
+    for r in scored:
+        if r["score_flags"]:
+            try:
+                all_flags.extend(json.loads(r["score_flags"]))
+            except Exception:
+                pass
+    if all_flags:
+        top = Counter(all_flags).most_common(3)
+        flag_str = "  ".join(f"{f}({n})" for f, n in top)
+        click.echo(f"   Top flags      : {flag_str}")
+
+    return regression
+
+
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
@@ -60,60 +115,76 @@ def status(tag: str | None, db_path: str | None) -> None:
     if not tags:
         click.echo("No calls captured yet. Wrap your client:\n")
         click.echo("    from evalloop import wrap")
-        click.echo("    client = wrap(openai.OpenAI())\n")
+        click.echo("    client = wrap(anthropic.Anthropic())\n")
         return
 
     now = time.time()
-    day = 86_400
-
     for t in tags:
-        rows = db.recent(task_tag=t, limit=500)
-        if not rows:
-            continue
-
-        scored = [r for r in rows if r["score"] is not None]
-        recent_7d = [r for r in scored if now - r["ts"] < 7 * day]
-        recent_1d = [r for r in scored if now - r["ts"] < day]
-
-        scores_7d = [r["score"] for r in recent_7d]
-        scores_1d = [r["score"] for r in recent_1d]
-        all_scores = [r["score"] for r in scored]
-
-        avg_7d = _avg(scores_7d)
-        avg_1d = _avg(scores_1d)
-        regression = avg_1d < avg_7d - 0.05 if scores_7d and scores_1d else False
-
-        status_icon = "🔴" if regression else "🟢"
-        click.echo(f"\n{status_icon}  [{t}]")
-        click.echo(f"   Calls captured : {len(rows)}")
-        click.echo(f"   Scored         : {len(scored)}")
-        click.echo(f"   Avg (7d)       : {avg_7d:.2f}")
-        click.echo(f"   Avg (24h)      : {avg_1d:.2f}" if scores_1d else "   Avg (24h)      : —")
-
-        if regression:
-            drop = (avg_7d - avg_1d) * 100
-            click.echo(f"   ⚠  Regression   : score dropped {drop:.1f}pp in last 24h")
-
-        if all_scores:
-            bar = _trend_bar(list(reversed(all_scores)))
-            click.echo(f"   Trend (recent) : {bar}")
-
-        # Surface top flags
-        all_flags: list[str] = []
-        import json
-        for r in scored:
-            if r["score_flags"]:
-                try:
-                    all_flags.extend(json.loads(r["score_flags"]))
-                except Exception:
-                    pass
-        if all_flags:
-            from collections import Counter
-            top = Counter(all_flags).most_common(3)
-            flag_str = "  ".join(f"{f}({n})" for f, n in top)
-            click.echo(f"   Top flags      : {flag_str}")
+        _print_status(db, t, now)
 
     click.echo()
+
+
+@cli.command()
+@click.option("--tag", default=None, help="Watch a specific task tag.")
+@click.option("--db", "db_path", default=None, help="Path to evalloop DB.")
+@click.option("--interval", default=60, show_default=True, help="Poll interval in seconds.")
+def watch(tag: str | None, db_path: str | None, interval: int) -> None:
+    """Poll for score regressions and alert to terminal. Ctrl-C to stop."""
+    db = DB(db_path)
+    click.echo(f"evalloop watch — polling every {interval}s. Ctrl-C to stop.\n")
+
+    try:
+        while True:
+            now = time.time()
+            tags = [tag] if tag else db.all_task_tags()
+            had_regression = False
+            for t in tags:
+                reg = _print_status(db, t, now)
+                if reg:
+                    had_regression = True
+            if not tags:
+                click.echo("No calls captured yet. Waiting...")
+            elif not had_regression:
+                click.echo(f"  [ok] No regressions detected. Next check in {interval}s.")
+            click.echo()
+            time.sleep(interval)
+    except KeyboardInterrupt:
+        click.echo("\nWatch stopped.")
+
+
+@cli.command()
+@click.option("--tag", default=None, help="Export calls for a specific task tag.")
+@click.option("--format", "fmt", default="json",
+              type=click.Choice(["json", "csv"]), show_default=True,
+              help="Output format.")
+@click.option("--limit", default=1000, show_default=True, help="Max rows to export.")
+@click.option("--db", "db_path", default=None, help="Path to evalloop DB.")
+@click.option("--output", "-o", default=None, help="Output file (default: stdout).")
+def export(tag: str | None, fmt: str, limit: int, db_path: str | None, output: str | None) -> None:
+    """Export captured calls and scores to JSON or CSV."""
+    db = DB(db_path)
+    rows = db.export(task_tag=tag, limit=limit)
+
+    if not rows:
+        click.echo("No calls to export.", err=True)
+        return
+
+    if fmt == "json":
+        content = json.dumps(rows, indent=2, default=str)
+    else:
+        buf = io.StringIO()
+        writer = csv.DictWriter(buf, fieldnames=rows[0].keys())
+        writer.writeheader()
+        writer.writerows(rows)
+        content = buf.getvalue()
+
+    if output:
+        with open(output, "w", encoding="utf-8") as f:
+            f.write(content)
+        click.echo(f"Exported {len(rows)} rows to {output}", err=True)
+    else:
+        click.echo(content)
 
 
 @cli.group()

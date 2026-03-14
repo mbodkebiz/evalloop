@@ -16,9 +16,13 @@ Score pipeline:
     │
     ├─▶ baseline check (no_baseline → return score 0.0)
     │
-    └─▶ embedding cosine similarity → composite score
-              │
-              └─▶ Score(value, flags, confidence)
+    ├─▶ embedding cosine similarity → composite score
+    │         │
+    │         └──▶ Score(value, flags, confidence)
+    │
+    └─▶ [embed fails] → degraded_mode fallback
+              │   heuristics-only score (0.5 for normal-length outputs)
+              └──▶ Score(value=0.5, flags=["degraded_mode"], confidence=0.1)
 """
 
 from __future__ import annotations
@@ -155,8 +159,10 @@ def score(
         output_embedding = all_embeddings[0]
         baseline_embeddings = all_embeddings[1:]
     except Exception:
-        # Never raise into caller — embedding failure returns partial score
-        return Score(value=0.0, flags=flags + ["embed_error"], confidence=0.0)
+        # Embedding unavailable — fall back to heuristics-only score.
+        # A non-empty, normal-length output scores 0.5 (neutral, not failure).
+        # Signals that scoring is degraded, not that the output is bad.
+        return Score(value=0.5, flags=flags + ["degraded_mode"], confidence=0.1)
 
     baseline_centroid = _centroid(baseline_embeddings)
     similarity = _cosine(output_embedding, baseline_centroid)

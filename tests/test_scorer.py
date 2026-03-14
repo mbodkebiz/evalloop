@@ -140,3 +140,42 @@ def test_score_has_confidence():
         result = score("Paris is the capital of France.", ["Paris is the capital."])
     assert hasattr(result, "confidence")
     assert 0.0 <= result.confidence <= 1.0
+
+
+# ---------------------------------------------------------------------------
+# Degraded mode — embed failure falls back to heuristics-only score
+# ---------------------------------------------------------------------------
+
+def test_degraded_mode_returns_partial_score_not_zero():
+    """When embed fails, non-empty normal-length output gets 0.5, not 0.0."""
+    def failing_embed(texts):
+        raise ConnectionError("Voyage AI unavailable")
+
+    result = score(
+        "The capital of France is Paris.",
+        ["The capital of France is Paris."],
+        embed_fn=failing_embed,
+    )
+    assert "degraded_mode" in result.flags
+    assert result.value == 0.5
+    assert result.confidence < 0.5  # low confidence signalled
+
+
+def test_degraded_mode_still_catches_empty():
+    """Even in degraded mode, empty output returns 0.0 (heuristic fires first)."""
+    def failing_embed(texts):
+        raise ConnectionError("Voyage AI unavailable")
+
+    result = score("", ["some baseline"], embed_fn=failing_embed)
+    assert result.value == 0.0
+    assert "empty" in result.flags
+
+
+def test_degraded_mode_still_catches_too_short():
+    """Even in degraded mode, too-short output returns 0.0."""
+    def failing_embed(texts):
+        raise ConnectionError("Voyage AI unavailable")
+
+    result = score("Hi", ["The capital of France is Paris."], embed_fn=failing_embed)
+    assert result.value == 0.0
+    assert "too_short" in result.flags
