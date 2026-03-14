@@ -196,7 +196,7 @@ def _call_llm_judge(output: str, baseline_outputs: list[str]) -> float:
     client = anthropic.Anthropic()
 
     if baseline_outputs:
-        examples = "\n".join(f"- {b[:300]}" for b in baseline_outputs[:3])
+        examples = "\n".join(f"- {b[:300]}" for b in baseline_outputs[:5])
         prompt = (
             f"Rate this AI response against the quality examples below.\n\n"
             f"Examples of good responses:\n{examples}\n\n"
@@ -273,3 +273,53 @@ def llm_judge_score(
         return Score(value=round(value, 4), flags=["llm_judge"], confidence=0.7)
     except Exception:
         return Score(value=0.5, flags=["llm_judge", "degraded_mode"], confidence=0.1)
+
+
+# ---------------------------------------------------------------------------
+# Heuristics-only scoring (no embedding backend)
+# ---------------------------------------------------------------------------
+
+
+def heuristics_score(
+    output: str | None,
+    baseline_outputs: list[str | None],
+) -> Score:
+    """
+    Score using heuristics only — no embedding or LLM backend needed.
+
+    Runs the same length/format gates as score() but returns degraded_mode
+    immediately instead of attempting to embed. Used by capture.py when no
+    scoring API keys are configured.
+
+    Args:
+        output:           The LLM output to score.
+        baseline_outputs: Known-good outputs for length reference.
+
+    Returns:
+        Score(0.0) on heuristic failure, Score(0.5, ["degraded_mode"]) otherwise.
+    """
+    if output is None:
+        output = ""
+
+    clean_baselines = [b for b in (baseline_outputs or []) if b is not None]
+    stripped = output.strip()
+
+    if not stripped:
+        return Score(value=0.0, flags=["empty"], confidence=1.0)
+
+    if not clean_baselines:
+        return Score(value=0.0, flags=["no_baseline"], confidence=0.0)
+
+    output_words = len(stripped.split())
+    median_baseline_words = _median_length(clean_baselines)
+
+    if output_words < _MIN_WORDS or (
+        median_baseline_words > 0
+        and output_words / median_baseline_words < _TOO_SHORT_RATIO
+    ):
+        return Score(value=0.0, flags=["too_short"], confidence=1.0)
+
+    if median_baseline_words > 0 and output_words / median_baseline_words > _TOO_LONG_RATIO:
+        return Score(value=0.5, flags=["too_long", "degraded_mode"], confidence=0.1)
+
+    return Score(value=0.5, flags=["degraded_mode"], confidence=0.1)

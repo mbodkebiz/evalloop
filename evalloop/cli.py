@@ -166,6 +166,7 @@ def init() -> None:
         click.echo("2. Add it to your environment:")
         click.echo("   export ANTHROPIC_API_KEY=sk-ant-...")
         click.echo("   # or add to your .env file")
+        _init_install_baselines()
     elif choice == "V":
         click.echo()
         click.echo("1. Get your Voyage AI key (free tier available):")
@@ -174,6 +175,7 @@ def init() -> None:
         click.echo("2. Add it to your environment:")
         click.echo("   export VOYAGE_API_KEY=pa-...")
         click.echo("   # or add to your .env file")
+        _init_install_baselines()
     else:
         click.echo()
         click.echo("Running in heuristics-only mode.")
