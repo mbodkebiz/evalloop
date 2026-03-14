@@ -1,72 +1,195 @@
 """
-capture.py tests — wrapping, non-blocking, silent error handling.
+capture.py tests — Anthropic-first wrapping, OpenAI secondary, non-blocking,
+silent error handling, response shape extraction.
 """
 
 import time
 from unittest.mock import MagicMock, patch
 
-from evalloop.capture import CapturedCall, _CaptureWorker, wrap
+from evalloop.capture import CapturedCall, _CaptureWorker, _extract_output, wrap
 
 
 # ---------------------------------------------------------------------------
-# wrap() returns a proxy
+# Helpers — fake Anthropic and OpenAI response shapes
 # ---------------------------------------------------------------------------
 
 
-def test_wrap_returns_proxy():
+def _anthropic_response(text: str, model: str = "claude-haiku-4-5-20251001") -> MagicMock:
+    """Mimics anthropic.types.Message response shape."""
+    block = MagicMock()
+    block.type = "text"
+    block.text = text
+    resp = MagicMock()
+    resp.content = [block]
+    resp.model = model
+    # Ensure .choices is absent so OpenAI path is not hit
+    del resp.choices
+    type(resp).__module__ = "anthropic.types"
+    return resp
+
+
+def _openai_response(text: str) -> MagicMock:
+    """Mimics openai.types.chat.ChatCompletion response shape."""
+    resp = MagicMock()
+    resp.choices[0].message.content = text
+    # Ensure .content is absent so Anthropic path is not hit
+    del resp.content
+    return resp
+
+
+def _anthropic_client() -> MagicMock:
     client = MagicMock()
+    type(client).__module__ = "anthropic"
+    return client
+
+
+def _openai_client() -> MagicMock:
+    client = MagicMock()
+    type(client).__module__ = "openai"
+    return client
+
+
+# ---------------------------------------------------------------------------
+# _extract_output — response shape extraction
+# ---------------------------------------------------------------------------
+
+
+def test_extract_output_anthropic_shape():
+    resp = _anthropic_response("Paris is the capital of France.")
+    assert _extract_output(resp) == "Paris is the capital of France."
+
+
+def test_extract_output_openai_shape():
+    resp = _openai_response("Paris is the capital of France.")
+    assert _extract_output(resp) == "Paris is the capital of France."
+
+
+def test_extract_output_anthropic_multiple_blocks():
+    b1, b2 = MagicMock(), MagicMock()
+    b1.type, b1.text = "text", "Hello "
+    b2.type, b2.text = "text", "world"
+    resp = MagicMock()
+    resp.content = [b1, b2]
+    del resp.choices
+    assert _extract_output(resp) == "Hello world"
+
+
+def test_extract_output_anthropic_skips_non_text_blocks():
+    tool_block = MagicMock()
+    tool_block.type = "tool_use"
+    text_block = MagicMock()
+    text_block.type = "text"
+    text_block.text = "answer"
+    resp = MagicMock()
+    resp.content = [tool_block, text_block]
+    del resp.choices
+    assert _extract_output(resp) == "answer"
+
+
+def test_extract_output_unknown_shape_returns_empty():
+    resp = MagicMock(spec=[])  # no .content, no .choices
+    assert _extract_output(resp) == ""
+
+
+# ---------------------------------------------------------------------------
+# wrap() — client detection
+# ---------------------------------------------------------------------------
+
+
+def test_wrap_anthropic_client_returns_proxy_with_messages():
+    client = _anthropic_client()
     wrapped = wrap(client)
-    assert wrapped is not client
+    assert hasattr(wrapped, "messages")
+
+
+def test_wrap_openai_client_returns_proxy_with_chat():
+    client = _openai_client()
+    wrapped = wrap(client)
     assert hasattr(wrapped, "chat")
 
 
-def test_wrap_passes_through_non_chat_attrs():
-    client = MagicMock()
-    client.files = "files-attr"
+def test_wrap_passes_through_non_intercepted_attrs():
+    client = _anthropic_client()
+    client.beta = "beta-attr"
     wrapped = wrap(client)
-    assert wrapped.files == "files-attr"
+    assert wrapped.beta == "beta-attr"
 
 
 # ---------------------------------------------------------------------------
-# Proxy captures calls and returns original response
+# Anthropic: messages.create captures correctly
 # ---------------------------------------------------------------------------
 
 
-def test_create_returns_original_response():
-    mock_response = MagicMock()
-    mock_response.choices[0].message.content = "test output"
+def test_anthropic_create_returns_original_response():
+    resp = _anthropic_response("4")
+    client = _anthropic_client()
+    client.messages.create.return_value = resp
 
-    client = MagicMock()
-    client.chat.completions.create.return_value = mock_response
-
-    wrapped = wrap(client)
-    result = wrapped.chat.completions.create(
-        model="gpt-4o",
-        messages=[{"role": "user", "content": "hello"}],
+    wrapped = wrap(client, task_tag="math")
+    result = wrapped.messages.create(
+        model="claude-haiku-4-5-20251001",
+        max_tokens=100,
+        messages=[{"role": "user", "content": "2+2?"}],
     )
-    assert result is mock_response
+    assert result is resp
 
 
-def test_create_queues_captured_call():
-    mock_response = MagicMock()
-    mock_response.choices[0].message.content = "Paris is the capital of France."
-
-    client = MagicMock()
-    client.chat.completions.create.return_value = mock_response
+def test_anthropic_create_queues_captured_call():
+    resp = _anthropic_response("Paris is the capital of France.", model="claude-haiku-4-5-20251001")
+    client = _anthropic_client()
+    client.messages.create.return_value = resp
 
     worker = MagicMock()
     with patch("evalloop.capture._get_worker", return_value=worker):
         wrapped = wrap(client, task_tag="qa")
-        wrapped.chat.completions.create(
-            model="gpt-4o",
-            messages=[{"role": "user", "content": "What is the capital of France?"}],
+        wrapped.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=100,
+            messages=[{"role": "user", "content": "Capital of France?"}],
         )
 
     worker.put.assert_called_once()
     call: CapturedCall = worker.put.call_args[0][0]
     assert call.output_text == "Paris is the capital of France."
     assert call.task_tag == "qa"
-    assert call.model == "gpt-4o"
+    assert call.model == "claude-haiku-4-5-20251001"
+
+
+# ---------------------------------------------------------------------------
+# OpenAI: chat.completions.create captures correctly
+# ---------------------------------------------------------------------------
+
+
+def test_openai_create_returns_original_response():
+    resp = _openai_response("4")
+    client = _openai_client()
+    client.chat.completions.create.return_value = resp
+
+    wrapped = wrap(client)
+    result = wrapped.chat.completions.create(
+        model="gpt-4o",
+        messages=[{"role": "user", "content": "2+2?"}],
+    )
+    assert result is resp
+
+
+def test_openai_create_queues_captured_call():
+    resp = _openai_response("Paris is the capital of France.")
+    client = _openai_client()
+    client.chat.completions.create.return_value = resp
+
+    worker = MagicMock()
+    with patch("evalloop.capture._get_worker", return_value=worker):
+        wrapped = wrap(client, task_tag="qa")
+        wrapped.chat.completions.create(
+            model="gpt-4o",
+            messages=[{"role": "user", "content": "Capital of France?"}],
+        )
+
+    worker.put.assert_called_once()
+    call: CapturedCall = worker.put.call_args[0][0]
+    assert call.output_text == "Paris is the capital of France."
+    assert call.task_tag == "qa"
 
 
 # ---------------------------------------------------------------------------
@@ -75,23 +198,17 @@ def test_create_queues_captured_call():
 
 
 def test_capture_does_not_block_caller():
-    """The caller must get the response before scoring completes."""
-    mock_response = MagicMock()
-    mock_response.choices[0].message.content = "output"
+    resp = _anthropic_response("output")
+    client = _anthropic_client()
+    client.messages.create.return_value = resp
 
-    client = MagicMock()
-    client.chat.completions.create.return_value = mock_response
-
-    slow_worker = MagicMock()
-    slow_worker.put = MagicMock()  # put is instant (queues to background)
-
-    with patch("evalloop.capture._get_worker", return_value=slow_worker):
+    worker = MagicMock()
+    with patch("evalloop.capture._get_worker", return_value=worker):
         wrapped = wrap(client)
         t0 = time.monotonic()
-        wrapped.chat.completions.create(model="gpt-4o", messages=[])
+        wrapped.messages.create(model="claude-haiku-4-5-20251001", max_tokens=10, messages=[])
         elapsed = time.monotonic() - t0
 
-    # put() must return in < 50ms (it's a queue.put_nowait)
     assert elapsed < 0.05, f"capture blocked for {elapsed:.3f}s"
 
 
@@ -101,24 +218,19 @@ def test_capture_does_not_block_caller():
 
 
 def test_broken_response_does_not_raise():
-    """If the response has an unexpected shape, capture fails silently."""
-    broken_response = MagicMock()
-    del broken_response.choices  # simulate unexpected response shape
-
-    client = MagicMock()
-    client.chat.completions.create.return_value = broken_response
+    broken = MagicMock(spec=[])  # no .content, no .choices, no .model
+    client = _anthropic_client()
+    client.messages.create.return_value = broken
 
     wrapped = wrap(client)
-    result = wrapped.chat.completions.create(model="gpt-4o", messages=[])
-    assert result is broken_response  # still returned to caller
+    result = wrapped.messages.create(model="claude-haiku-4-5-20251001", max_tokens=10, messages=[])
+    assert result is broken  # still returned to caller
 
 
 def test_full_queue_does_not_raise():
-    """Queue full must be silently dropped, not raise."""
     import queue as q
     worker = _CaptureWorker.__new__(_CaptureWorker)
     worker._queue = q.Queue(maxsize=1)
-    worker._queue.put_nowait(MagicMock())  # fill it up
+    worker._queue.put_nowait(MagicMock())  # fill it
 
-    # Should not raise even though queue is full
-    worker.put(MagicMock())
+    worker.put(MagicMock())  # must not raise

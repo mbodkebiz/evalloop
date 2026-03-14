@@ -3,8 +3,13 @@ capture.py — intercept LLM calls and queue them for scoring.
 
 Usage:
     from evalloop import wrap
-    client = wrap(openai.OpenAI())
+    import anthropic
+
+    client = wrap(anthropic.Anthropic(), task_tag="my-bot")
     # All calls through client are captured automatically.
+
+    # OpenAI also supported:
+    client = wrap(openai.OpenAI(), task_tag="my-bot")
 
 Design:
   - Client wrapper pattern (not monkey-patch): explicit, async-safe, testable.
@@ -17,10 +22,9 @@ Architecture:
   user call
       │
       ▼
-  WrappedCompletions.create()
-      │  returns immediately
-      │
-      ├─▶ original openai call (unchanged, full response returned to user)
+  wrap(client).messages.create()   ← Anthropic
+  wrap(client).chat.completions.create()  ← OpenAI
+      │  returns immediately (response handed back to user)
       │
       └─▶ _queue.put_nowait(CapturedCall(...))   ← non-blocking
                 │
@@ -29,6 +33,10 @@ Architecture:
                 │
                 ├─▶ scorer.score(output, baselines)
                 └─▶ db.insert(call + score)        ← silent on failure
+
+Response shape differences:
+  Anthropic: response.content[0].text  (TextBlock)
+  OpenAI:    response.choices[0].message.content
 """
 
 from __future__ import annotations
@@ -58,6 +66,39 @@ class CapturedCall:
     latency_ms: float
     task_tag: str = "default"
     extra: dict = field(default_factory=dict)
+
+
+# ---------------------------------------------------------------------------
+# Response text extraction (handles both Anthropic and OpenAI shapes)
+# ---------------------------------------------------------------------------
+
+
+def _extract_output(response: Any) -> str:
+    """
+    Extract text output from an LLM response object.
+    Anthropic: response.content is a list of blocks; grab text blocks.
+    OpenAI:    response.choices[0].message.content
+    Returns "" on any unexpected shape — never raises.
+    """
+    # Anthropic shape: response.content = [TextBlock(text=..., type="text"), ...]
+    content = getattr(response, "content", None)
+    if isinstance(content, list) and content:
+        parts = []
+        for block in content:
+            if getattr(block, "type", None) == "text":
+                parts.append(getattr(block, "text", ""))
+        if parts:
+            return "".join(parts)
+
+    # OpenAI shape: response.choices[0].message.content
+    choices = getattr(response, "choices", None)
+    if choices:
+        try:
+            return choices[0].message.content or ""
+        except (AttributeError, IndexError):
+            pass
+
+    return ""
 
 
 # ---------------------------------------------------------------------------
@@ -132,11 +173,13 @@ def _get_worker() -> _CaptureWorker:
 
 
 # ---------------------------------------------------------------------------
-# Proxy classes
+# Proxy classes — Anthropic
 # ---------------------------------------------------------------------------
 
 
-class _WrappedCompletions:
+class _WrappedMessages:
+    """Wraps anthropic.Anthropic().messages"""
+
     def __init__(self, original: Any, task_tag: str):
         self._original = original
         self._task_tag = task_tag
@@ -147,15 +190,11 @@ class _WrappedCompletions:
         latency_ms = (time.monotonic() - t0) * 1000
 
         try:
-            messages = kwargs.get("messages", [])
-            model = kwargs.get("model", "unknown")
-            output_text = response.choices[0].message.content or ""
-
             _get_worker().put(CapturedCall(
                 ts=time.time(),
-                model=model,
-                input_messages=list(messages),
-                output_text=output_text,
+                model=kwargs.get("model", getattr(response, "model", "unknown")),
+                input_messages=list(kwargs.get("messages", [])),
+                output_text=_extract_output(response),
                 latency_ms=latency_ms,
                 task_tag=self._task_tag,
             ))
@@ -165,21 +204,64 @@ class _WrappedCompletions:
         return response
 
 
-class _WrappedChat:
-    def __init__(self, original: Any, task_tag: str):
-        self.completions = _WrappedCompletions(original.completions, task_tag)
-
-
-class _WrappedClient:
-    """Thin proxy that wraps only the surfaces evalloop intercepts."""
+class _WrappedAnthropicClient:
+    """Proxy for anthropic.Anthropic()"""
 
     def __init__(self, client: Any, task_tag: str):
         self._client = client
-        self.chat = _WrappedChat(client.chat, task_tag)
+        self.messages = _WrappedMessages(client.messages, task_tag)
 
     def __getattr__(self, name: str) -> Any:
-        # Pass through everything else unchanged (embeddings, files, etc.)
         return getattr(self._client, name)
+
+
+# ---------------------------------------------------------------------------
+# Proxy classes — OpenAI (secondary)
+# ---------------------------------------------------------------------------
+
+
+class _WrappedCompletions:
+    """Wraps openai.OpenAI().chat.completions"""
+
+    def __init__(self, original: Any, task_tag: str):
+        self._original = original
+        self._task_tag = task_tag
+
+    def create(self, *args: Any, **kwargs: Any) -> Any:
+        t0 = time.monotonic()
+        response = self._original.create(*args, **kwargs)
+        latency_ms = (time.monotonic() - t0) * 1000
+
+        try:
+            _get_worker().put(CapturedCall(
+                ts=time.time(),
+                model=kwargs.get("model", "unknown"),
+                input_messages=list(kwargs.get("messages", [])),
+                output_text=_extract_output(response),
+                latency_ms=latency_ms,
+                task_tag=self._task_tag,
+            ))
+        except Exception as exc:  # noqa: BLE001
+            _warn(f"evalloop: capture error — {exc}")
+
+        return response
+
+
+class _WrappedOpenAIClient:
+    """Proxy for openai.OpenAI()"""
+
+    def __init__(self, client: Any, task_tag: str):
+        self._client = client
+        self._task_tag = task_tag
+        self.chat = _WrappedOpenAIChat(client.chat, task_tag)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._client, name)
+
+
+class _WrappedOpenAIChat:
+    def __init__(self, original: Any, task_tag: str):
+        self.completions = _WrappedCompletions(original.completions, task_tag)
 
 
 # ---------------------------------------------------------------------------
@@ -187,29 +269,44 @@ class _WrappedClient:
 # ---------------------------------------------------------------------------
 
 
-def wrap(client: Any, task_tag: str = "default") -> _WrappedClient:
+def wrap(client: Any, task_tag: str = "default") -> Any:
     """
-    Wrap an OpenAI client to capture all chat.completions.create calls.
+    Wrap an Anthropic or OpenAI client to capture all LLM calls.
 
-    Args:
-        client:   An openai.OpenAI() (or compatible) client instance.
-        task_tag: Label used to look up the right baselines (e.g. "customer-service").
+    Anthropic (primary):
+        import anthropic
+        from evalloop import wrap
 
-    Returns:
-        A proxy client. Use it exactly like the original.
+        client = wrap(anthropic.Anthropic(), task_tag="my-bot")
+        resp = client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=1024,
+            messages=[{"role": "user", "content": "What is 2+2?"}],
+        )
 
-    Example:
+    OpenAI (also supported):
         import openai
         from evalloop import wrap
 
-        client = wrap(openai.OpenAI(), task_tag="qa-bot")
+        client = wrap(openai.OpenAI(), task_tag="my-bot")
         resp = client.chat.completions.create(
             model="gpt-4o",
             messages=[{"role": "user", "content": "What is 2+2?"}],
         )
-        # Capture queued in background. Zero latency added.
+
+    Args:
+        client:   anthropic.Anthropic() or openai.OpenAI() instance.
+        task_tag: Label used to look up the right baselines.
+
+    Returns:
+        A proxy client. Use it exactly like the original.
+        Zero latency added — capture happens in a background thread.
     """
-    return _WrappedClient(client, task_tag)
+    # Detect client type by module name — avoids hard import deps
+    module = type(client).__module__ or ""
+    if module.startswith("anthropic"):
+        return _WrappedAnthropicClient(client, task_tag)
+    return _WrappedOpenAIClient(client, task_tag)
 
 
 # ---------------------------------------------------------------------------
