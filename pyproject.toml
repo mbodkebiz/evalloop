@@ -10,16 +10,13 @@ readme = "README.md"
 license = {text = "MIT"}
 requires-python = ">=3.9"
 dependencies = [
-    "anthropic>=0.40.0",
-    "voyageai>=0.2.4",
-    "numpy>=1.24.0",
     "click>=8.0.0",
 ]
 
 [project.optional-dependencies]
-openai = [
-    "openai>=1.0.0",
-]
+anthropic = ["anthropic>=0.40.0"]
+voyage = ["voyageai>=0.2.4"]
+openai = ["openai>=1.0.0"]
 dev = [
     "pytest>=7.0.0",
     "pytest-asyncio>=0.21.0",

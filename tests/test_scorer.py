@@ -7,7 +7,7 @@ Run: pytest tests/test_scorer.py -v
 import pytest
 from unittest.mock import patch
 
-from evalloop.scorer import Score, score
+from evalloop.scorer import Score, llm_judge_score, score
 from tests.golden_set import GOLDEN_SET
 
 
@@ -179,3 +179,59 @@ def test_degraded_mode_still_catches_too_short():
     result = score("Hi", ["The capital of France is Paris."], embed_fn=failing_embed)
     assert result.value == 0.0
     assert "too_short" in result.flags
+
+
+# ---------------------------------------------------------------------------
+# LLM-as-judge scoring
+# ---------------------------------------------------------------------------
+
+
+def _fake_llm_judge_call(output, baselines):
+    """Deterministic fake: returns 0.9 for non-empty outputs."""
+    return 0.9
+
+
+def test_llm_judge_score_returns_score_object():
+    with patch("evalloop.scorer._call_llm_judge", side_effect=_fake_llm_judge_call):
+        result = llm_judge_score("Paris is the capital of France.", ["Paris is the capital."])
+    assert isinstance(result, Score)
+    assert "llm_judge" in result.flags
+    assert 0.0 <= result.value <= 1.0
+
+
+def test_llm_judge_score_empty_returns_zero():
+    result = llm_judge_score("", ["some baseline"])
+    assert result.value == 0.0
+    assert "empty" in result.flags
+
+
+def test_llm_judge_score_too_short_returns_zero():
+    result = llm_judge_score("Hi", ["The capital of France is Paris."])
+    assert result.value == 0.0
+    assert "too_short" in result.flags
+
+
+def test_llm_judge_score_degraded_when_llm_fails():
+    """When LLM call fails, returns 0.5 with degraded_mode flag."""
+    def failing_judge(output, baselines):
+        raise ConnectionError("Anthropic unavailable")
+
+    with patch("evalloop.scorer._call_llm_judge", side_effect=failing_judge):
+        result = llm_judge_score("Some output here.", ["Some good output."])
+    assert result.value == 0.5
+    assert "degraded_mode" in result.flags
+    assert result.confidence < 0.5
+
+
+def test_llm_judge_score_none_output():
+    result = llm_judge_score(None, ["some baseline"])
+    assert result.value == 0.0
+    assert "empty" in result.flags
+
+
+def test_llm_judge_score_no_baselines():
+    """No baselines should still work — LLM judges on its own."""
+    with patch("evalloop.scorer._call_llm_judge", side_effect=_fake_llm_judge_call):
+        result = llm_judge_score("Paris is the capital of France.", [])
+    assert isinstance(result, Score)
+    assert "llm_judge" in result.flags

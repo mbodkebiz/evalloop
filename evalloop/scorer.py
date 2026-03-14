@@ -2,32 +2,36 @@
 Scorer — consistency-first LLM output scoring.
 
 Design principles:
-  - Deterministic: same input always produces the same score.
-  - Heuristics first: length/format checks run before embeddings.
-  - Embeddings second: cosine similarity to baseline examples.
-  - LLM-as-judge: NOT used here. Reserved for ambiguous cases (future).
-  - Never raises: all errors produce Score(value=0.0) with an error flag.
+  - Heuristics first: length/format checks run before any scoring.
+  - Three scoring backends (auto-detected by capture.py):
+      voyage      → cosine similarity via Voyage AI embeddings (most accurate)
+      anthropic   → LLM-as-judge via Claude Haiku (uses existing API key)
+      heuristics  → length/format checks only (no semantic scoring)
+  - Never raises: all errors produce a Score with an error flag.
 
-Score pipeline:
-  output
-    │
-    ├─▶ heuristics (empty, too_short, too_long)
-    │       │ if disqualifying → return early with score 0.0
-    │
-    ├─▶ baseline check (no_baseline → return score 0.0)
-    │
-    ├─▶ embedding cosine similarity → composite score
-    │         │
-    │         └──▶ Score(value, flags, confidence)
-    │
-    └─▶ [embed fails] → degraded_mode fallback
-              │   heuristics-only score (0.5 for normal-length outputs)
-              └──▶ Score(value=0.5, flags=["degraded_mode"], confidence=0.1)
+Score pipelines:
+
+  Voyage (score()):
+    output
+      ├─▶ heuristics → early return if disqualifying
+      ├─▶ embed via Voyage AI → cosine similarity to baseline centroid
+      └─▶ [embed fails] → degraded_mode fallback (0.5, confidence=0.1)
+
+  LLM-as-judge (llm_judge_score()):
+    output
+      ├─▶ heuristics → early return if disqualifying
+      ├─▶ Claude Haiku rates output vs baseline examples → 0-10 normalised
+      └─▶ [LLM call fails] → degraded_mode fallback (0.5, confidence=0.1)
+
+  Heuristics-only:
+    output
+      └─▶ heuristics only → 0.0 (fail) or 0.5 (pass, degraded_mode flag)
 """
 
 from __future__ import annotations
 
 import math
+import re
 from dataclasses import dataclass, field
 from typing import Callable
 
@@ -174,3 +178,98 @@ def score(
     final_value = similarity if "too_long" not in flags else min(similarity, 0.5)
 
     return Score(value=round(final_value, 4), flags=flags, confidence=round(confidence, 4))
+
+
+# ---------------------------------------------------------------------------
+# LLM-as-judge scoring (Anthropic backend)
+# ---------------------------------------------------------------------------
+
+
+def _call_llm_judge(output: str, baseline_outputs: list[str]) -> float:
+    """
+    Ask Claude Haiku to rate output quality against baselines.
+    Returns a float in [0.0, 1.0]. Raises on any failure.
+    Lazy-imports anthropic — only used when ANTHROPIC_API_KEY is set.
+    """
+    import anthropic  # lazy — user already has this installed
+
+    client = anthropic.Anthropic()
+
+    if baseline_outputs:
+        examples = "\n".join(f"- {b[:300]}" for b in baseline_outputs[:3])
+        prompt = (
+            f"Rate this AI response against the quality examples below.\n\n"
+            f"Examples of good responses:\n{examples}\n\n"
+            f"Response to rate:\n{output[:600]}\n\n"
+            f"Reply with only a number 0-10 where:\n"
+            f"10 = matches or exceeds example quality\n"
+            f"5  = acceptable but noticeably worse\n"
+            f"0  = wrong, off-topic, or useless"
+        )
+    else:
+        prompt = (
+            f"Rate this AI response for quality and helpfulness.\n\n"
+            f"Response:\n{output[:600]}\n\n"
+            f"Reply with only a number 0-10 where 10=excellent, 0=useless."
+        )
+
+    resp = client.messages.create(
+        model="claude-haiku-4-5-20251001",
+        max_tokens=5,
+        messages=[{"role": "user", "content": prompt}],
+    )
+    text = resp.content[0].text.strip() if resp.content else ""
+    match = re.search(r"\d+(?:\.\d+)?", text)
+    if match:
+        return max(0.0, min(1.0, float(match.group()) / 10.0))
+    return 0.5  # unparseable response — neutral fallback
+
+
+def llm_judge_score(
+    output: str | None,
+    baseline_outputs: list[str | None],
+) -> Score:
+    """
+    Score an LLM output using Claude Haiku as judge.
+
+    Runs the same heuristics as score() first (empty, too_short).
+    Falls back to degraded_mode (0.5) if the LLM call fails.
+    Never raises.
+
+    Args:
+        output:           The LLM output to score.
+        baseline_outputs: Known-good outputs for context (optional).
+
+    Returns:
+        Score with value in [0.0, 1.0], flags including "llm_judge",
+        and confidence=0.7 (LLM judge is less consistent than embeddings).
+    """
+    if output is None:
+        output = ""
+
+    clean_baselines = [b for b in (baseline_outputs or []) if b is not None]
+    stripped = output.strip()
+
+    # Heuristics first — same gates as score()
+    if not stripped:
+        return Score(value=0.0, flags=["empty"], confidence=1.0)
+
+    output_words = len(stripped.split())
+    if output_words < _MIN_WORDS:
+        return Score(value=0.0, flags=["too_short"], confidence=1.0)
+
+    if clean_baselines:
+        median_baseline_words = _median_length(clean_baselines)
+        if median_baseline_words > 0 and output_words / median_baseline_words > _TOO_LONG_RATIO:
+            # Too long — flag and cap, but still judge
+            try:
+                value = _call_llm_judge(stripped, clean_baselines)
+                return Score(value=round(min(value, 0.5), 4), flags=["too_long", "llm_judge"], confidence=0.7)
+            except Exception:
+                return Score(value=0.5, flags=["too_long", "llm_judge", "degraded_mode"], confidence=0.1)
+
+    try:
+        value = _call_llm_judge(stripped, clean_baselines)
+        return Score(value=round(value, 4), flags=["llm_judge"], confidence=0.7)
+    except Exception:
+        return Score(value=0.5, flags=["llm_judge", "degraded_mode"], confidence=0.1)
