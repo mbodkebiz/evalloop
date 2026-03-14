@@ -11,12 +11,17 @@ Usage:
     # OpenAI also supported:
     client = wrap(openai.OpenAI(), task_tag="my-bot")
 
+    # Opt out of storing input messages (for PII-sensitive environments):
+    client = wrap(anthropic.Anthropic(), task_tag="my-bot", store_inputs=False)
+
 Design:
   - Client wrapper pattern (not monkey-patch): explicit, async-safe, testable.
   - Fire-and-forget: background thread drains a queue so the user's call path
     has zero added latency.
   - Silent on all errors: disk full, DB locked, embed failure — log to stderr,
     never propagate into user code.
+  - atexit flush: on normal Python exit, waits up to 5s for queue to drain
+    so script users don't lose captures.
 
 Architecture:
   user call
@@ -28,11 +33,13 @@ Architecture:
       │
       └─▶ _queue.put_nowait(CapturedCall(...))   ← non-blocking
                 │
-                ▼ (background thread)
+                ▼ (background daemon thread)
           _worker() drains queue
                 │
+                ├─▶ infer_tag() if tag="default"
                 ├─▶ scorer.score(output, baselines)
-                └─▶ db.insert(call + score)        ← silent on failure
+                │       └─▶ [embed fails] degraded_mode score (not 0.0)
+                └─▶ db.insert(call + score + embed_model)  ← silent on failure
 
 Response shape differences:
   Anthropic: response.content[0].text  (TextBlock)
@@ -41,15 +48,20 @@ Response shape differences:
 
 from __future__ import annotations
 
+import atexit
+import os
 import queue
-import sys
 import threading
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
 
+from evalloop._utils import _warn
 from evalloop.db import DB
 from evalloop.scorer import score as _score
+
+# Embedding model name stored alongside each score for provenance
+_EMBED_MODEL = "voyage-3-lite"
 
 
 # ---------------------------------------------------------------------------
@@ -61,11 +73,10 @@ from evalloop.scorer import score as _score
 class CapturedCall:
     ts: float
     model: str
-    input_messages: list[dict]
+    input_messages: list[dict] | None  # None when store_inputs=False
     output_text: str
     latency_ms: float
     task_tag: str = "default"
-    extra: dict = field(default_factory=dict)
 
 
 # ---------------------------------------------------------------------------
@@ -110,13 +121,25 @@ class _CaptureWorker:
     """
     Drains the capture queue in a daemon thread.
     All errors are caught and logged to stderr — never propagated.
+
+    Throughput note: each item requires one Voyage AI embed call (~200-500ms).
+    The single thread can process ~2-5 calls/sec. For high-volume batch use,
+    queue items will back up. Queue maxsize=1000 provides ~3-8 min of buffer
+    at typical LLM call rates. Batched embedding is a future optimization.
     """
 
     def __init__(self, db_path: str | None = None):
         self._queue: queue.Queue[CapturedCall | None] = queue.Queue(maxsize=1000)
-        self._db = DB(db_path)
+        # DB init failure must not propagate into user code
+        try:
+            self._db: DB | None = DB(db_path)
+        except Exception as exc:  # noqa: BLE001
+            _warn(f"evalloop: DB init failed — scoring disabled ({exc})")
+            self._db = None
         self._thread = threading.Thread(target=self._run, daemon=True, name="evalloop-capture")
         self._thread.start()
+        # Flush on normal Python exit so script users don't lose captures
+        atexit.register(self.flush)
 
     def put(self, call: CapturedCall) -> None:
         """Non-blocking enqueue. Drops silently if queue is full."""
@@ -155,18 +178,23 @@ class _CaptureWorker:
             _warn(f"evalloop: scoring error — {exc}")
             result = None
 
+        if self._db is None:
+            return
+
         try:
-            self._db.insert(call, result)
+            embed_model = _EMBED_MODEL if result and "degraded_mode" not in result.flags else None
+            self._db.insert(call, result, embed_model=embed_model)
         except Exception as exc:  # noqa: BLE001
             _warn(f"evalloop: db insert error — {exc}")
 
     def flush(self, timeout: float = 5.0) -> None:
         """Block until all queued calls are fully processed or timeout."""
-        # queue.join() blocks until every put()'d item has called task_done()
         done = threading.Event()
+
         def _join() -> None:
             self._queue.join()
             done.set()
+
         t = threading.Thread(target=_join, daemon=True)
         t.start()
         done.wait(timeout=timeout)
@@ -194,9 +222,10 @@ def _get_worker() -> _CaptureWorker:
 class _WrappedMessages:
     """Wraps anthropic.Anthropic().messages"""
 
-    def __init__(self, original: Any, task_tag: str):
+    def __init__(self, original: Any, task_tag: str, store_inputs: bool):
         self._original = original
         self._task_tag = task_tag
+        self._store_inputs = store_inputs
 
     def create(self, *args: Any, **kwargs: Any) -> Any:
         t0 = time.monotonic()
@@ -204,13 +233,29 @@ class _WrappedMessages:
         latency_ms = (time.monotonic() - t0) * 1000
 
         try:
+            # Infer tag from system prompt if user didn't specify one
+            tag = self._task_tag
+            if tag == "default":
+                try:
+                    from evalloop.defaults import infer_tag
+                    system = kwargs.get("system", "")
+                    if not system:
+                        # Also check messages list for a system-role message
+                        for msg in kwargs.get("messages", []):
+                            if isinstance(msg, dict) and msg.get("role") == "system":
+                                system = msg.get("content", "")
+                                break
+                    tag = infer_tag(system) or "default"
+                except Exception:  # noqa: BLE001
+                    tag = "default"
+
             _get_worker().put(CapturedCall(
                 ts=time.time(),
                 model=kwargs.get("model", getattr(response, "model", "unknown")),
-                input_messages=list(kwargs.get("messages", [])),
+                input_messages=list(kwargs.get("messages", [])) if self._store_inputs else None,
                 output_text=_extract_output(response),
                 latency_ms=latency_ms,
-                task_tag=self._task_tag,
+                task_tag=tag,
             ))
         except Exception as exc:  # noqa: BLE001
             _warn(f"evalloop: capture error — {exc}")
@@ -221,9 +266,9 @@ class _WrappedMessages:
 class _WrappedAnthropicClient:
     """Proxy for anthropic.Anthropic()"""
 
-    def __init__(self, client: Any, task_tag: str):
+    def __init__(self, client: Any, task_tag: str, store_inputs: bool):
         self._client = client
-        self.messages = _WrappedMessages(client.messages, task_tag)
+        self.messages = _WrappedMessages(client.messages, task_tag, store_inputs)
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self._client, name)
@@ -237,9 +282,10 @@ class _WrappedAnthropicClient:
 class _WrappedCompletions:
     """Wraps openai.OpenAI().chat.completions"""
 
-    def __init__(self, original: Any, task_tag: str):
+    def __init__(self, original: Any, task_tag: str, store_inputs: bool):
         self._original = original
         self._task_tag = task_tag
+        self._store_inputs = store_inputs
 
     def create(self, *args: Any, **kwargs: Any) -> Any:
         t0 = time.monotonic()
@@ -247,13 +293,27 @@ class _WrappedCompletions:
         latency_ms = (time.monotonic() - t0) * 1000
 
         try:
+            # Infer tag from system-role message if user didn't specify one
+            tag = self._task_tag
+            if tag == "default":
+                try:
+                    from evalloop.defaults import infer_tag
+                    system = ""
+                    for msg in kwargs.get("messages", []):
+                        if isinstance(msg, dict) and msg.get("role") == "system":
+                            system = msg.get("content", "")
+                            break
+                    tag = infer_tag(system) or "default"
+                except Exception:  # noqa: BLE001
+                    tag = "default"
+
             _get_worker().put(CapturedCall(
                 ts=time.time(),
                 model=kwargs.get("model", "unknown"),
-                input_messages=list(kwargs.get("messages", [])),
+                input_messages=list(kwargs.get("messages", [])) if self._store_inputs else None,
                 output_text=_extract_output(response),
                 latency_ms=latency_ms,
-                task_tag=self._task_tag,
+                task_tag=tag,
             ))
         except Exception as exc:  # noqa: BLE001
             _warn(f"evalloop: capture error — {exc}")
@@ -264,18 +324,18 @@ class _WrappedCompletions:
 class _WrappedOpenAIClient:
     """Proxy for openai.OpenAI()"""
 
-    def __init__(self, client: Any, task_tag: str):
+    def __init__(self, client: Any, task_tag: str, store_inputs: bool):
         self._client = client
         self._task_tag = task_tag
-        self.chat = _WrappedOpenAIChat(client.chat, task_tag)
+        self.chat = _WrappedOpenAIChat(client.chat, task_tag, store_inputs)
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self._client, name)
 
 
 class _WrappedOpenAIChat:
-    def __init__(self, original: Any, task_tag: str):
-        self.completions = _WrappedCompletions(original.completions, task_tag)
+    def __init__(self, original: Any, task_tag: str, store_inputs: bool):
+        self.completions = _WrappedCompletions(original.completions, task_tag, store_inputs)
 
 
 # ---------------------------------------------------------------------------
@@ -283,7 +343,7 @@ class _WrappedOpenAIChat:
 # ---------------------------------------------------------------------------
 
 
-def wrap(client: Any, task_tag: str = "default") -> Any:
+def wrap(client: Any, task_tag: str = "default", store_inputs: bool = True) -> Any:
     """
     Wrap an Anthropic or OpenAI client to capture all LLM calls.
 
@@ -308,29 +368,31 @@ def wrap(client: Any, task_tag: str = "default") -> Any:
             messages=[{"role": "user", "content": "What is 2+2?"}],
         )
 
+    PII-sensitive environments:
+        client = wrap(anthropic.Anthropic(), task_tag="my-bot", store_inputs=False)
+        # Captures output + score only. Input messages are not stored.
+
     Args:
-        client:   anthropic.Anthropic() or openai.OpenAI() instance.
-        task_tag: Label used to look up the right baselines.
+        client:       anthropic.Anthropic() or openai.OpenAI() instance.
+        task_tag:     Label used to look up the right baselines. If not set,
+                      evalloop will try to infer it from your system prompt.
+        store_inputs: If False, input messages are not stored in the DB.
+                      Useful for PII-sensitive environments. Default: True.
 
     Returns:
         A proxy client. Use it exactly like the original.
         Zero latency added — capture happens in a background thread.
     """
+    # Warn loudly if VOYAGE_API_KEY is missing — scoring will be degraded
+    if not os.environ.get("VOYAGE_API_KEY"):
+        _warn(
+            "evalloop: VOYAGE_API_KEY not set — scores will use degraded mode "
+            "(heuristics only, no semantic similarity). "
+            "Get a free key at https://www.voyageai.com"
+        )
+
     # Detect client type by module name — avoids hard import deps
     module = type(client).__module__ or ""
     if module.startswith("anthropic"):
-        return _WrappedAnthropicClient(client, task_tag)
-    return _WrappedOpenAIClient(client, task_tag)
-
-
-# ---------------------------------------------------------------------------
-# Internal helpers
-# ---------------------------------------------------------------------------
-
-
-def _warn(msg: str) -> None:
-    """Write a warning to stderr. Never raises."""
-    try:
-        print(msg, file=sys.stderr)
-    except Exception:  # noqa: BLE001
-        pass
+        return _WrappedAnthropicClient(client, task_tag, store_inputs)
+    return _WrappedOpenAIClient(client, task_tag, store_inputs)

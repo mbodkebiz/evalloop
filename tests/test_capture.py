@@ -1,8 +1,9 @@
 """
 capture.py tests — Anthropic-first wrapping, OpenAI secondary, non-blocking,
-silent error handling, response shape extraction.
+silent error handling, response shape extraction, tag inference, store_inputs.
 """
 
+import os
 import time
 from unittest.mock import MagicMock, patch
 
@@ -234,3 +235,134 @@ def test_full_queue_does_not_raise():
     worker._queue.put_nowait(MagicMock())  # fill it
 
     worker.put(MagicMock())  # must not raise
+
+
+# ---------------------------------------------------------------------------
+# Tag inference — system prompt → task_tag
+# ---------------------------------------------------------------------------
+
+
+def test_tag_inferred_from_system_prompt():
+    """wrap() without task_tag should infer tag from system prompt."""
+    resp = _anthropic_response("Short summary here.")
+    client = _anthropic_client()
+    client.messages.create.return_value = resp
+
+    worker = MagicMock()
+    with patch("evalloop.capture._get_worker", return_value=worker):
+        wrapped = wrap(client)  # no task_tag
+        wrapped.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=100,
+            system="You are a helpful assistant that summarizes documents.",
+            messages=[{"role": "user", "content": "Summarize this."}],
+        )
+
+    call: CapturedCall = worker.put.call_args[0][0]
+    assert call.task_tag == "summarization"
+
+
+def test_tag_defaults_when_no_match():
+    """Unrecognized system prompt falls back to 'default'."""
+    resp = _anthropic_response("Arr, I be a pirate!")
+    client = _anthropic_client()
+    client.messages.create.return_value = resp
+
+    worker = MagicMock()
+    with patch("evalloop.capture._get_worker", return_value=worker):
+        wrapped = wrap(client)
+        wrapped.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=100,
+            system="You are a pirate.",
+            messages=[{"role": "user", "content": "Say something."}],
+        )
+
+    call: CapturedCall = worker.put.call_args[0][0]
+    assert call.task_tag == "default"
+
+
+# ---------------------------------------------------------------------------
+# store_inputs=False — PII opt-out
+# ---------------------------------------------------------------------------
+
+
+def test_store_inputs_false_sets_input_messages_to_none():
+    resp = _anthropic_response("Paris is the capital.")
+    client = _anthropic_client()
+    client.messages.create.return_value = resp
+
+    worker = MagicMock()
+    with patch("evalloop.capture._get_worker", return_value=worker):
+        wrapped = wrap(client, task_tag="qa", store_inputs=False)
+        wrapped.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=100,
+            messages=[{"role": "user", "content": "Capital of France?"}],
+        )
+
+    call: CapturedCall = worker.put.call_args[0][0]
+    assert call.input_messages is None
+
+
+def test_store_inputs_true_stores_messages():
+    resp = _anthropic_response("Paris.")
+    client = _anthropic_client()
+    client.messages.create.return_value = resp
+
+    worker = MagicMock()
+    with patch("evalloop.capture._get_worker", return_value=worker):
+        wrapped = wrap(client, task_tag="qa", store_inputs=True)
+        wrapped.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=100,
+            messages=[{"role": "user", "content": "Capital of France?"}],
+        )
+
+    call: CapturedCall = worker.put.call_args[0][0]
+    assert call.input_messages is not None
+    assert len(call.input_messages) == 1
+
+
+# ---------------------------------------------------------------------------
+# VOYAGE_API_KEY warning
+# ---------------------------------------------------------------------------
+
+
+def test_wrap_warns_when_voyage_key_missing(capsys, monkeypatch):
+    monkeypatch.delenv("VOYAGE_API_KEY", raising=False)
+    client = _anthropic_client()
+    wrap(client)
+    captured = capsys.readouterr()
+    assert "VOYAGE_API_KEY" in captured.err
+
+
+def test_wrap_no_warn_when_voyage_key_present(capsys, monkeypatch):
+    monkeypatch.setenv("VOYAGE_API_KEY", "pa-testkey123")
+    client = _anthropic_client()
+    wrap(client)
+    captured = capsys.readouterr()
+    assert "VOYAGE_API_KEY" not in captured.err
+
+
+# ---------------------------------------------------------------------------
+# DB init failure — worker continues without crashing user code
+# ---------------------------------------------------------------------------
+
+
+def test_worker_continues_when_db_init_fails():
+    """If DB can't be created, worker still processes queue without raising."""
+    with patch("evalloop.capture.DB", side_effect=Exception("disk full")):
+        worker = _CaptureWorker(db_path="/nonexistent/🚫/path")
+
+    # Worker should be running and accepting items without raising
+    call = CapturedCall(
+        ts=0.0,
+        model="test",
+        input_messages=None,
+        output_text="test",
+        latency_ms=0.0,
+        task_tag="default",
+    )
+    worker.put(call)  # must not raise
+    assert worker._db is None

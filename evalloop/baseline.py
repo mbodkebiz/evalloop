@@ -4,23 +4,37 @@ baseline.py — manage known-good output examples per task tag.
 Baselines are stored as JSONL files in ~/.evalloop/baselines/<task_tag>.jsonl
 Each line: {"output": "..."}
 
-Returns None (never raises) when no baseline exists — caller must handle
+Returns empty list (never raises) when no baseline exists — caller must handle
 the no_baseline case (scorer returns Score(0.0, ["no_baseline"])).
+
+task_tag is sanitized to [a-zA-Z0-9_-] before use as a filename to prevent
+path traversal and filesystem surprises.
 """
 
 from __future__ import annotations
 
 import json
 import os
-import sys
+import re
 from pathlib import Path
+
+from evalloop._utils import _warn
 
 
 _BASELINE_DIR = os.path.expanduser("~/.evalloop/baselines")
 
+# Only alphanumeric, dash, underscore allowed in task tags used as filenames
+_TAG_RE = re.compile(r"[^a-zA-Z0-9_-]")
+
+
+def _sanitize_tag(task_tag: str) -> str:
+    """Strip characters that are unsafe in filenames. 'default' if empty result."""
+    sanitized = _TAG_RE.sub("", task_tag)
+    return sanitized or "default"
+
 
 def _path(task_tag: str) -> Path:
-    return Path(_BASELINE_DIR) / f"{task_tag}.jsonl"
+    return Path(_BASELINE_DIR) / f"{_sanitize_tag(task_tag)}.jsonl"
 
 
 def add(output: str, task_tag: str = "default") -> None:
@@ -83,10 +97,3 @@ def list_tags() -> list[str]:
         return [p.stem for p in Path(_BASELINE_DIR).glob("*.jsonl")]
     except Exception:  # noqa: BLE001
         return []
-
-
-def _warn(msg: str) -> None:
-    try:
-        print(msg, file=sys.stderr)
-    except Exception:  # noqa: BLE001
-        pass

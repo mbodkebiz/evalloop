@@ -80,3 +80,22 @@ def test_load_never_raises_on_corrupt_file(tmp_path, monkeypatch):
     p.write_bytes(b"\xff\xfe invalid utf-8 \x80\x81")
     result = bl.load("corrupt")
     assert isinstance(result, list)  # empty list, no exception
+
+
+# ---------------------------------------------------------------------------
+# task_tag sanitization — path traversal prevention
+# ---------------------------------------------------------------------------
+
+def test_sanitize_tag_strips_path_traversal():
+    from evalloop.baseline import _sanitize_tag
+    assert _sanitize_tag("../../etc/passwd") == "etcpasswd"
+
+
+def test_sanitize_tag_allows_valid_chars():
+    from evalloop.baseline import _sanitize_tag
+    assert _sanitize_tag("qa-bot_v2") == "qa-bot_v2"
+
+
+def test_sanitize_tag_empty_result_becomes_default():
+    from evalloop.baseline import _sanitize_tag
+    assert _sanitize_tag("../..") == "default"
