@@ -8,6 +8,7 @@ import time
 from unittest.mock import MagicMock, patch
 
 from evalloop.capture import CapturedCall, _CaptureWorker, _extract_output, wrap
+from evalloop.scorer import Score
 
 
 # ---------------------------------------------------------------------------
@@ -365,6 +366,82 @@ def test_detect_scorer_prefers_voyage_over_anthropic(monkeypatch):
     monkeypatch.setenv("VOYAGE_API_KEY", "pa-testkey")
     monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-testkey")
     assert _detect_scorer() == "voyage"
+
+
+# ---------------------------------------------------------------------------
+# _process() routing — correct scorer called based on env vars
+# ---------------------------------------------------------------------------
+
+
+def _make_call(text: str = "This is a sufficiently long output for testing purposes.") -> CapturedCall:
+    return CapturedCall(
+        ts=0.0,
+        model="test-model",
+        input_messages=None,
+        output_text=text,
+        latency_ms=0.0,
+        task_tag="qa",
+    )
+
+
+def test_process_routes_to_llm_judge_when_anthropic_key_set(monkeypatch, tmp_path):
+    """_process() calls _llm_judge_score (not _score) when ANTHROPIC_API_KEY is set."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test")
+    monkeypatch.delenv("VOYAGE_API_KEY", raising=False)
+
+    worker = _CaptureWorker(db_path=str(tmp_path / "test.db"))
+    with (
+        patch("evalloop.capture._llm_judge_score", return_value=Score(0.8, ["llm_judge"])) as mock_judge,
+        patch("evalloop.capture._score") as mock_score,
+        patch("evalloop.capture._heuristics_score") as mock_heuristics,
+        patch("evalloop.baseline.load", return_value=["good answer"]),
+        patch("evalloop.defaults.install"),
+    ):
+        worker._process(_make_call())
+
+    mock_judge.assert_called_once()
+    mock_score.assert_not_called()
+    mock_heuristics.assert_not_called()
+
+
+def test_process_routes_to_score_when_voyage_key_set(monkeypatch, tmp_path):
+    """_process() calls _score (not _llm_judge_score) when VOYAGE_API_KEY is set."""
+    monkeypatch.setenv("VOYAGE_API_KEY", "pa-testkey")
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+
+    worker = _CaptureWorker(db_path=str(tmp_path / "test.db"))
+    with (
+        patch("evalloop.capture._score", return_value=Score(0.9, [])) as mock_score,
+        patch("evalloop.capture._llm_judge_score") as mock_judge,
+        patch("evalloop.capture._heuristics_score") as mock_heuristics,
+        patch("evalloop.baseline.load", return_value=["good answer"]),
+        patch("evalloop.defaults.install"),
+    ):
+        worker._process(_make_call())
+
+    mock_score.assert_called_once()
+    mock_judge.assert_not_called()
+    mock_heuristics.assert_not_called()
+
+
+def test_process_routes_to_heuristics_when_no_keys_set(monkeypatch, tmp_path):
+    """_process() calls _heuristics_score when no scoring keys are configured."""
+    monkeypatch.delenv("VOYAGE_API_KEY", raising=False)
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+
+    worker = _CaptureWorker(db_path=str(tmp_path / "test.db"))
+    with (
+        patch("evalloop.capture._heuristics_score", return_value=Score(0.5, ["degraded_mode"])) as mock_heuristics,
+        patch("evalloop.capture._score") as mock_score,
+        patch("evalloop.capture._llm_judge_score") as mock_judge,
+        patch("evalloop.baseline.load", return_value=["good answer"]),
+        patch("evalloop.defaults.install"),
+    ):
+        worker._process(_make_call())
+
+    mock_heuristics.assert_called_once()
+    mock_score.assert_not_called()
+    mock_judge.assert_not_called()
 
 
 # ---------------------------------------------------------------------------

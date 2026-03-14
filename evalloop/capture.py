@@ -58,6 +58,7 @@ from typing import Any
 
 from evalloop._utils import _warn
 from evalloop.db import DB
+from evalloop.scorer import heuristics_score as _heuristics_score
 from evalloop.scorer import llm_judge_score as _llm_judge_score
 from evalloop.scorer import score as _score
 
@@ -195,10 +196,11 @@ class _CaptureWorker:
             scorer_backend = _detect_scorer()
             if scorer_backend == "anthropic":
                 result = _llm_judge_score(call.output_text, baselines)
-            else:
-                # voyage or heuristics — both use score(); voyage has embed,
-                # heuristics falls through to degraded_mode automatically
+            elif scorer_backend == "voyage":
                 result = _score(call.output_text, baselines)
+            else:
+                # heuristics-only — skip embedding entirely
+                result = _heuristics_score(call.output_text, baselines)
         except Exception as exc:  # noqa: BLE001
             _warn(f"evalloop: scoring error — {exc}")
 
