@@ -157,7 +157,14 @@ def _print_status(db: DB, tag: str, now: float) -> bool:
         click.echo(f" Trend           {spark}{direction}")
 
     # ── Summary line ────────────────────────────────────────
-    click.echo(f"\n {len(rows)} calls · {len(scored)} scored · {backend_label}")
+    _BACKEND_DESC = {
+        "heuristics":   "heuristics only  (length & format checks, max 50%)",
+        "LLM-as-judge": "LLM-as-judge  (Claude rates quality vs baselines, 0–100%)",
+        "Voyage AI":    "Voyage AI  (semantic similarity vs baselines, 0–100%)",
+    }
+    mode_desc = _BACKEND_DESC.get(backend_label, backend_label)
+    click.echo(f"\n {len(rows)} calls · {len(scored)} scored")
+    click.echo(f" Scoring: {mode_desc}")
 
     # ── Issues in plain English ─────────────────────────────
     issues = []
@@ -324,6 +331,17 @@ def status(tag: str | None, db_path: str | None) -> None:
         _print_status(db, t, now)
 
     click.echo()
+    click.echo("─" * 34)
+    click.echo(" What does the score mean?")
+    click.echo("   Score = how well your LLM outputs match")
+    click.echo("   your known-good baseline examples.")
+    click.echo("   100% = perfect match  ·  0% = bad or empty output")
+    click.echo()
+    click.echo(" Scoring modes:")
+    click.echo("   heuristics   max 50%  length & format checks only")
+    click.echo("   LLM-as-judge 0–100%  set ANTHROPIC_API_KEY")
+    click.echo("   Voyage AI    0–100%  set VOYAGE_API_KEY")
+    click.echo("─" * 34)
 
 
 @cli.command()
