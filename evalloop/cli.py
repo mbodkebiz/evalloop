@@ -50,8 +50,41 @@ def _trend_bar(scores: list[float], width: int = 20) -> str:
     return "".join(blocks[min(8, int(s * 8))] for s in scores[-width:])
 
 
+def _score_bar(value: float, width: int = 16) -> str:
+    """Filled progress bar for a 0.0–1.0 score."""
+    filled = round(value * width)
+    return "█" * filled + "░" * (width - filled)
+
+
+def _trend_direction(scores: list[float]) -> str:
+    """Return ↑ rising / ↓ falling / → steady based on recent vs older scores."""
+    if len(scores) < 4:
+        return ""
+    mid = len(scores) // 2
+    older = sum(scores[:mid]) / mid
+    newer = sum(scores[mid:]) / (len(scores) - mid)
+    if newer > older + 0.05:
+        return " ↑ rising"
+    if newer < older - 0.05:
+        return " ↓ falling"
+    return " → steady"
+
+
 def _avg(values: list[float]) -> float:
     return sum(values) / len(values) if values else 0.0
+
+
+# Human-readable translations for internal flag names.
+# Use {n} as a placeholder for the count.
+_FLAG_MESSAGES = {
+    "empty":         "{n} empty output(s) — LLM returned nothing",
+    "too_short":     "{n} output(s) too short to score meaningfully",
+    "too_long":      "{n} output(s) unusually long vs baseline",
+    "no_baseline":   "{n} call(s) had no baseline to compare against",
+    "degraded_mode": "{n} call(s) in degraded mode — no semantic scoring",
+    "llm_judge":     None,   # informational — don't surface
+    "error":         "{n} call(s) hit a scorer error",
+}
 
 
 def _print_status(db: DB, tag: str, now: float) -> bool:
@@ -73,33 +106,83 @@ def _print_status(db: DB, tag: str, now: float) -> bool:
     avg_1d = _avg(scores_1d)
     regression = avg_1d < avg_7d - 0.05 if scores_7d and scores_1d else False
 
-    status_icon = "🔴" if regression else "🟢"
-    click.echo(f"\n{status_icon}  [{tag}]")
-    click.echo(f"   Calls captured : {len(rows)}")
-    click.echo(f"   Scored         : {len(scored)}")
-    click.echo(f"   Avg (7d)       : {avg_7d:.2f}")
-    click.echo(f"   Avg (24h)      : {avg_1d:.2f}" if scores_1d else "   Avg (24h)      : —")
+    # Detect scoring backend from embed_model field
+    embed_models = [r["embed_model"] for r in scored if r["embed_model"]]
+    if embed_models:
+        last_model = embed_models[0]
+        if "haiku" in last_model or "llm" in last_model:
+            backend_label = "LLM-as-judge"
+        elif "voyage" in last_model:
+            backend_label = "Voyage AI"
+        else:
+            backend_label = last_model
+    else:
+        backend_label = "heuristics"
 
-    if regression:
-        drop = (avg_7d - avg_1d) * 100
-        click.echo(f"   ⚠  Regression   : score dropped {drop:.1f}pp in last 24h")
-
-    if all_scores:
-        bar = _trend_bar(list(reversed(all_scores)))
-        click.echo(f"   Trend (recent) : {bar}")
-
-    # Surface top flags
-    all_flags: list[str] = []
+    # Collect flags
+    flag_counts: Counter = Counter()
     for r in scored:
         if r["score_flags"]:
             try:
-                all_flags.extend(json.loads(r["score_flags"]))
+                flag_counts.update(json.loads(r["score_flags"]))
             except Exception:
                 pass
-    if all_flags:
-        top = Counter(all_flags).most_common(3)
-        flag_str = "  ".join(f"{f}({n})" for f, n in top)
-        click.echo(f"   Top flags      : {flag_str}")
+
+    # ── Header ──────────────────────────────────────────────
+    rule = "─" * 34
+    status_icon = "🔴" if regression else "🟢"
+    status_word = "REGRESSION" if regression else "OK"
+    click.echo(f"\n{rule}")
+    click.echo(f" {tag:<28} {status_icon} {status_word}")
+    click.echo(rule)
+
+    # ── Scores ──────────────────────────────────────────────
+    pct_7d = int(avg_7d * 100)
+    bar_7d = _score_bar(avg_7d)
+    click.echo(f" Score (7d avg)   {pct_7d:>3}%  {bar_7d}")
+
+    if scores_1d:
+        pct_1d = int(avg_1d * 100)
+        bar_1d = _score_bar(avg_1d)
+        click.echo(f" Score (24h avg)  {pct_1d:>3}%  {bar_1d}")
+
+        if regression:
+            drop = (avg_7d - avg_1d) * 100
+            click.echo(f"\n ⚠  Score dropped {drop:.0f}% in the last 24 hours")
+
+    # ── Trend sparkline ─────────────────────────────────────
+    if all_scores:
+        spark = _trend_bar(list(reversed(all_scores)))
+        direction = _trend_direction(list(reversed(all_scores)))
+        click.echo(f" Trend           {spark}{direction}")
+
+    # ── Summary line ────────────────────────────────────────
+    click.echo(f"\n {len(rows)} calls · {len(scored)} scored · {backend_label}")
+
+    # ── Issues in plain English ─────────────────────────────
+    issues = []
+    for flag, msg in _FLAG_MESSAGES.items():
+        if msg and flag in flag_counts:
+            n = flag_counts[flag]
+            issues.append((n, msg.format(n=n)))
+
+    # Sort by count descending, show top 3
+    if issues:
+        click.echo()
+        for _, msg in sorted(issues, reverse=True)[:3]:
+            click.echo(f" ⚠  {msg}")
+
+
+    # ── Contextual tips ─────────────────────────────────────
+    tips = []
+    if backend_label == "heuristics":
+        tips.append("→ Add ANTHROPIC_API_KEY for semantic scoring (0–100%)")
+    if "no_baseline" in flag_counts:
+        tips.append("→ Run: evalloop baseline add \"a good answer\" --tag " + tag)
+    if tips:
+        click.echo()
+        for tip in tips:
+            click.echo(f"   {tip}")
 
     return regression
 
